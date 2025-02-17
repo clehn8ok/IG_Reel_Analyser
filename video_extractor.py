@@ -1,29 +1,21 @@
 import pandas as pd
-import csv
-import sys
 import os
 from typing import List, Dict
 import yt_dlp
 import cv2
 import numpy as np
-from reportlab.lib import colors
-from reportlab.lib.pagesizes import letter, landscape
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as ReportLabImage, Table, TableStyle, PageBreak, KeepTogether
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as ReportLabImage, Table, TableStyle, PageBreak
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.units import inch
 import shutil
-import statistics
 import whisper
 from moviepy.editor import VideoFileClip
-from PIL import Image as PILImage
-import torch
-from transformers import CLIPProcessor, CLIPModel
 import traceback
-from ultralytics import YOLO  # Add this to your imports
-from PyPDF2 import PdfMerger  # Add this to your imports
+from PyPDF2 import PdfMerger
+import easyocr  # pip install easyocr
 
-# Load YOLO model once at the start
-yolo_model = YOLO('yolov8n.pt')  # Using the nano model for speed, can use 's', 'm', or 'l' for better accuracy
+# Initialize EasyOCR reader (this will download the model on first run)
+reader = easyocr.Reader(['en'])
 
 def check_ffmpeg():
     """Check if FFmpeg is installed and provide instructions if not"""
@@ -34,511 +26,160 @@ def check_ffmpeg():
         print("Linux: Run 'sudo apt-get install ffmpeg' or equivalent")
         sys.exit(1)
 
-def convert_number(value: str) -> float:
-    """Convert string number (with possible comma) to float"""
-    if not value:  # Handle empty values
-        return 0.0
-    return float(value.replace(',', ''))
-
-def detect_scenes(video_path: str, threshold: float = 20.0, min_scene_duration: float = 1.0) -> List[tuple]:
-    """
-    Detect scene changes in video with scene merging
-    threshold: Higher value = less sensitive
-    min_scene_duration: Minimum scene duration in seconds
-    """
-    print("Starting scene detection...")
-    cap = cv2.VideoCapture(video_path)
-    
-    if not cap.isOpened():
-        raise ValueError("Could not open video file")
-
-    # Get video properties
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    duration = frame_count / fps
-    
-    print(f"Video properties: {fps} FPS, {duration:.1f}s duration")
-    
-    # Detect raw scenes first
-    raw_scenes = []
-    prev_frame = None
-    current_scene_start = 0
-    frame_number = 0
-    
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-            
-        # Convert to grayscale and blur
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (5, 5), 0)
-        
-        if prev_frame is not None:
-            # Calculate difference
-            diff = cv2.absdiff(gray, prev_frame)
-            mean_diff = np.mean(diff)
-            
-            if mean_diff > threshold:
-                scene_time = frame_number/fps
-                if raw_scenes or scene_time > 0.5:  # Skip very start of video
-                    raw_scenes.append((current_scene_start, scene_time))
-                current_scene_start = scene_time
-        
-        prev_frame = gray
-        frame_number += 1
-        
-        # Print progress
-        if frame_number % 30 == 0:
-            progress = (frame_number / frame_count) * 100
-            print(f"Processing: {progress:.1f}% complete", end='\r')
-    
-    # Add the final scene
-    if current_scene_start < duration:
-        raw_scenes.append((current_scene_start, duration))
-    
-    cap.release()
-    
-    # Merge short scenes
-    merged_scenes = []
-    current_start = None
-    current_end = None
-    
-    for start, end in raw_scenes:
-        if current_start is None:
-            current_start = start
-            current_end = end
-        else:
-            # If scene is too short, merge with previous
-            if end - start < min_scene_duration:
-                current_end = end
-            else:
-                # Add previous merged scene
-                merged_scenes.append((current_start, current_end))
-                current_start = start
-                current_end = end
-    
-    # Add final merged scene
-    if current_start is not None:
-        merged_scenes.append((current_start, current_end))
-    
-    # Print scene information
-    print("\nDetected scenes:")
-    for i, (start, end) in enumerate(merged_scenes, 1):
-        print(f"Scene {i}: {start:.1f}s - {end:.1f}s (duration: {end-start:.1f}s)")
-    
-    return merged_scenes
-
 def extract_audio_script(video_path: str) -> str:
-    """Extract speech from video and convert to text"""
-    import time
-    
+    """Extract and transcribe audio from video"""
     try:
-        # Load the Whisper model
-        model = whisper.load_model("base")
+        print("\nExtracting audio from video...")
+        video = VideoFileClip(video_path)
         
-        # Add delay to ensure file is released
-        time.sleep(2)
-        
-        # Extract audio with retry mechanism
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                print("Extracting audio from video...")
-                video = VideoFileClip(video_path)
-                audio_path = os.path.join(os.path.dirname(video_path), "temp_audio.wav")
-                video.audio.write_audiofile(audio_path, verbose=False, logger=None)
-                video.close()
-                break
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    print(f"Retry {attempt + 1}/{max_retries} after error: {str(e)}")
-                    time.sleep(2)  # Wait before retry
-                else:
-                    raise
-        
-        # Transcribe audio
         print("Transcribing audio...")
-        result = model.transcribe(audio_path)
+        model = whisper.load_model("base")
+        result = model.transcribe(video_path)
         
-        # Clean up
-        try:
-            os.remove(audio_path)
-        except:
-            pass
-            
-        return result["text"]
+        video.close()
+        return result["text"].strip()
+        
     except Exception as e:
-        print(f"Error extracting script: {str(e)}")
-        return "Script extraction failed"
+        print(f"Error extracting audio: {str(e)}")
+        return None
 
-def create_pdf_report(scenes: List[tuple], output_dir: str, reel_stats: Dict, script: str = None) -> None:
-    """Create PDF report with screenshots, timing information, and script"""
-    # Use the reel URL to create a more meaningful filename
-    pdf_path = os.path.join(output_dir, 'scene_analysis.pdf')
-    doc = SimpleDocTemplate(
-        pdf_path, 
-        pagesize=letter,
-        leftMargin=50,      
-        rightMargin=50,     
-        topMargin=50,       
-        bottomMargin=50     
-    )
+def create_pdf_report(output_dir: str, reel_stats: Dict, script: str = None) -> None:
+    """Create PDF report with reel title and transcription"""
+    pdf_path = os.path.join(output_dir, 'text_analysis.pdf')
+    doc = SimpleDocTemplate(pdf_path, pagesize=letter, leftMargin=50, rightMargin=50, topMargin=50, bottomMargin=50)
     styles = getSampleStyleSheet()
-    story = []
-
-    # Add title
-    title_style = ParagraphStyle(
-        'CustomTitle',
-        parent=styles['Heading1'],
-        fontSize=24,
-        spaceAfter=30,
-        alignment=1  # Center alignment
-    )
-    story.append(Paragraph("Reel Scene Analysis", title_style))
     
-    # Add URL
-    url_style = ParagraphStyle(
-        'URL',
-        parent=styles['Normal'],
-        fontSize=10,
-        spaceAfter=30,
-        alignment=1  # Center alignment
-    )
-    story.append(Paragraph(f"URL: {reel_stats.get('url', '')}", url_style))
-    story.append(PageBreak())
-
-    # Add statistics
-    stats_style = ParagraphStyle(
-        'Stats',
-        parent=styles['Normal'],
-        fontSize=12,
-        spaceAfter=20,
-        alignment=1  # Center alignment
-    )
-    stats_text = f"""
-    <b>Reel Statistics:</b><br/>
-    Views: {reel_stats.get('views', 0):,.0f}<br/>
-    Likes: {reel_stats.get('likes', 0):,.0f}<br/>
-    Comments: {reel_stats.get('comments', 0):,.0f}<br/>
-    URL: {reel_stats.get('url', '')}<br/>
-    """
-    story.append(Paragraph(stats_text, stats_style))
-    story.append(PageBreak())
-
-    # Create scene entries
-    for i, (start, end) in enumerate(scenes, 1):
-        try:
-            duration = end - start
-            screenshot_pattern = f"scene_{i:02d}_{start:.1f}s-{end:.1f}s.jpg"
-            img_path = os.path.join(output_dir, screenshot_pattern)
-            
-            if os.path.exists(img_path):
-                frame = cv2.imread(img_path)
-                if frame is not None:
-                    content_info = analyze_image_content(frame)
-                    style_info = analyze_video_style(frame)
-                    
-                    # Create detailed scene description with more padding
-                    scene_text = f"""
-                    <para alignment="left" spaceAfter="10">
-                    <b>Scene {i}</b><br/><br/>
-                    Time: {start:.1f}s - {end:.1f}s<br/>
-                    Duration: {duration:.1f}s<br/><br/>
-                    <b>Visual Analysis:</b><br/>
-                    Composition: {content_info['composition']}<br/>
-                    Main Object: {content_info['main_object']}<br/>
-                    Detected Objects: {content_info['all_objects']}<br/>
-                    Confidence: {content_info['confidence']:.2f}<br/><br/>
-                    <b>Style Analysis:</b><br/>
-                    Color Style: {style_info['color_style']}<br/>
-                    Lighting: {style_info['lighting']}<br/>
-                    Contrast: {style_info['contrast_level']}<br/>
-                    Composition: {style_info['composition']}<br/>
-                    </para>
-                    """
-                    
-                    # Create table with text and image
-                    img = ReportLabImage(img_path)
-                    img._restrictSize(350, 250)  # Slightly smaller images
-                    
-                    # Create table with better spacing
-                    data = [[Paragraph(scene_text, styles['Normal']), img]]
-                    table = Table(data, colWidths=[300, 350])  # Adjusted column widths
-                    table.setStyle(TableStyle([
-                        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-                        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-                        ('TOPPADDING', (0, 0), (-1, -1), 20),
-                        ('BOTTOMPADDING', (0, 0), (-1, -1), 20),
-                        ('LEFTPADDING', (0, 0), (-1, -1), 20),
-                        ('RIGHTPADDING', (0, 0), (-1, -1), 20),
-                    ]))
-                    
-                    story.append(table)
-                    story.append(PageBreak())
-                    
-                    print(f"Added scene {i} to PDF")
-        except Exception as e:
-            print(f"Error processing scene {i} for PDF: {str(e)}")
-            traceback.print_exc()
-            continue
-
-    # Add script section if available
-    if script and script.strip():
-        script_style = ParagraphStyle(
-            'ScriptStyle',
-            parent=styles['Normal'],
-            fontSize=11,
-            leading=14,
-            leftIndent=20,
-            rightIndent=20,
-            spaceAfter=20
-        )
-        story.append(Paragraph("<b>Video Script:</b>", styles['Heading2']))
-        story.append(Spacer(1, 12))
-        
-        # Split script into paragraphs for better formatting
-        script_paragraphs = script.split('\n')
-        for paragraph in script_paragraphs:
-            if paragraph.strip():  # Only add non-empty paragraphs
-                story.append(Paragraph(paragraph, script_style))
-                story.append(Spacer(1, 8))
+    # Create custom styles
+    title_style = ParagraphStyle('CustomTitle', parent=styles['Heading1'], fontSize=24, spaceAfter=30, alignment=1)
+    info_style = ParagraphStyle('Info', parent=styles['Normal'], fontSize=10, spaceAfter=10)
+    heading_style = ParagraphStyle('Heading', parent=styles['Heading2'], fontSize=14, spaceAfter=10)
+    
+    story = []
+    
+    # Title and metadata
+    story.append(Paragraph("Reel Analysis", title_style))
+    #story.append(Paragraph(f"<b>Title:</b> {reel_stats.get('title', 'Untitled')}", info_style))
+    story.append(Paragraph(f"<b>Description:</b> {reel_stats.get('description', '')}", info_style))
+    #story.append(Paragraph(f"<b>URL:</b> {reel_stats.get('url', '')}", info_style))
+    story.append(Paragraph(f"<b>Views:</b> {reel_stats.get('views', 0):,}", info_style))
+    
+    # Add transcription section
+    if script:
+        story.append(Spacer(1, 20))
+        story.append(Paragraph("Voice Over", heading_style))
+        story.append(Paragraph(script, info_style))
     
     # Generate PDF
     try:
-        if len(story) > 1:
-            doc.build(story)
-            print(f"PDF report generated successfully: {pdf_path}")
-        else:
-            print("Error: No content to generate PDF")
+        doc.build(story)
+        print(f"PDF report generated successfully: {pdf_path}")
     except Exception as e:
         print(f"Error generating PDF: {str(e)}")
         traceback.print_exc()
 
-def analyze_image_content(frame) -> Dict[str, str]:
-    """
-    Analyze image content using YOLO object detection
-    Returns detailed description and detected objects
-    """
-    try:
-        # Convert BGR to RGB
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        
-        # Run YOLO detection
-        results = yolo_model(frame_rgb)
-        
-        # Get detected objects with confidence scores
-        detected_objects = []
-        for r in results:
-            boxes = r.boxes
-            for box in boxes:
-                confidence = float(box.conf[0])
-                class_id = int(box.cls[0])
-                class_name = results[0].names[class_id]
-                if confidence > 0.3:  # Only include objects with >30% confidence
-                    detected_objects.append({
-                        'name': class_name,
-                        'confidence': confidence
-                    })
-        
-        # Sort by confidence
-        detected_objects.sort(key=lambda x: x['confidence'], reverse=True)
-        
-        # Analyze composition based on object placement
-        if len(detected_objects) > 0:
-            main_object = detected_objects[0]['name']
-            confidence = detected_objects[0]['confidence']
-            
-            # Create object list string
-            object_list = ', '.join([f"{obj['name']} ({obj['confidence']:.2f})" 
-                                   for obj in detected_objects[:3]])  # Top 3 objects
-            
-            # Determine shot type based on objects
-            if len(detected_objects) > 2:
-                composition = "complex scene with multiple objects"
-            else:
-                composition = f"focused shot of {main_object}"
-                
-        else:
-            main_object = "no clear objects detected"
-            confidence = 0.0
-            object_list = "none detected"
-            composition = "minimal composition"
-            
-        return {
-            'composition': composition,
-            'main_object': main_object,
-            'confidence': confidence,
-            'all_objects': object_list
-        }
-        
-    except Exception as e:
-        print(f"Error in content analysis: {str(e)}")
-        return {
-            'composition': 'unknown',
-            'main_object': 'unknown',
-            'confidence': 0.0,
-            'all_objects': 'analysis failed'
-        }
-
-def save_scene_screenshots(video_path: str, scenes: List[tuple], output_dir: str, reel_stats: Dict) -> None:
-    """Save middle frame of each scene as screenshot"""
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-        
-    cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    
-    print("\nSaving screenshots...")
-    for i, (start, end) in enumerate(scenes, 1):
-        # Take screenshot from middle of scene
-        middle_time = (start + end) / 2
-        middle_frame = int(middle_time * fps)
-        
-        cap.set(cv2.CAP_PROP_POS_FRAMES, middle_frame)
-        ret, frame = cap.read()
-        
-        if ret:
-            filename = f"scene_{i:02d}_{start:.1f}s-{end:.1f}s.jpg"
-            filepath = os.path.join(output_dir, filename)
-            cv2.imwrite(filepath, frame)
-            print(f"Saved screenshot {i}: {filename}")
-    
-    cap.release()
-    
-    # Now create the PDF report
-    create_pdf_report(scenes, output_dir, reel_stats)
-
 def download_and_analyze_reel(url: str, output_dir: str, reel_stats: Dict) -> None:
-    """Download reel and analyze its scenes"""
+    """Download and analyze a single reel"""
+    video_path = None
+    
     try:
-        # Extract reel ID from URL and get title
-        reel_id = url.split('/')[-2]  # Get the ID from the URL
-        with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
-            info = ydl.extract_info(url, download=False)
-            reel_title = f"{info['title']}_{reel_id}"  # Add reel ID to title
+        # Extract reel ID from URL
+        reel_id = url.split('/')[-2]  # Gets the ID from the URL
+        reel_dir = os.path.join(output_dir, f'reel_{reel_id}')
         
-        # Create unique folder for this reel
-        reel_dir = os.path.join(output_dir, reel_title)
         if not os.path.exists(reel_dir):
             os.makedirs(reel_dir)
         
-        # Download the reel with unique filename
+        # Configure yt-dlp options with the specific directory
         ydl_opts = {
             'format': 'best',
-            'outtmpl': os.path.join(reel_dir, f'%(title)s_{reel_id}.%(ext)s'),
-            'quiet': False,
+            'outtmpl': os.path.join(reel_dir, 'video.%(ext)s'),  # Simplified output template
+            'quiet': True,
+            'extract_flat': False,
+            'force_generic_extractor': False,
+            'add_header': [
+                'User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            ],
+            # Remove cookie handling for now
             'no_warnings': True,
+            'ignoreerrors': True
         }
         
-        video_path = None
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                video_path = ydl.prepare_filename(info)
-            print(f"\nSuccessfully downloaded reel to: {reel_dir}")
-            
-            # Make sure the video file exists before processing
-            if os.path.exists(video_path):
-                print("\nAnalyzing scenes...")
-                scenes = detect_scenes(video_path)
+        # Download video and get metadata
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            try:
+                # First get info
+                info = ydl.extract_info(url, download=True)  # Changed to True to combine info and download
                 
-                # Extract script
-                print("\nExtracting video script...")
-                script = extract_audio_script(video_path)
+                if info:
+                    # Update reel stats with metadata
+                    reel_stats.update({
+                        'title': info.get('title', 'Untitled'),
+                        'description': info.get('description', ''),
+                        'uploader': info.get('uploader', ''),
+                        'upload_date': info.get('upload_date', ''),
+                    })
+                    
+                    print(f"\nReel Title: {reel_stats['title']}")
+                    print(f"Reel Description: {reel_stats['description']}")
+                    
+                    # Get the actual video path
+                    video_path = os.path.join(reel_dir, 'video.' + info.get('ext', 'mp4'))
+                    
+                    if os.path.exists(video_path):
+                        print(f"\nSuccessfully downloaded reel to: {reel_dir}")
+                        
+                        # Extract audio script
+                        script = extract_audio_script(video_path)
+                        
+                        # Create PDF with reel info and script
+                        create_pdf_report(reel_dir, reel_stats, script)
+                        
+                        print(f"Results saved in: {reel_dir}")
+                    else:
+                        print(f"Error: Downloaded video not found at {video_path}")
+                else:
+                    print(f"Error: Could not extract info from {url}")
                 
-                # Save screenshots and create PDF
-                save_scene_screenshots(video_path, scenes, reel_dir, reel_stats)
-                create_pdf_report(scenes, reel_dir, reel_stats, script)  # Pass the script here
-                
-                print(f"\nScene analysis complete! Found {len(scenes)} scenes")
-                print(f"Results saved in: {reel_dir}")
-            else:
-                print(f"Error: Downloaded video not found at {video_path}")
+            except Exception as e:
+                print(f"Error extracting metadata: {str(e)}")
+                traceback.print_exc()
         
-        finally:
-            # Clean up video file
-            if video_path and os.path.exists(video_path):
+    except Exception as e:
+        print(f"Error processing reel {url}: {str(e)}")
+        traceback.print_exc()
+        
+    finally:
+        # Clean up video file if it exists
+        if video_path and os.path.exists(video_path):
+            try:
                 os.remove(video_path)
                 print(f"Cleaned up video file: {video_path}")
-        
-    except Exception as e:
-        print(f"Error processing reel: {str(e)}")
-
-def merge_pdf_reports(output_dir: str) -> None:
-    """Merge all PDF reports in the directory into one combined report"""
-    try:
-        merger = PdfMerger()
-        pdf_files = []
-        
-        # Find all PDF files in subdirectories
-        for root, dirs, files in os.walk(output_dir):
-            for file in files:
-                if file.endswith('scene_analysis.pdf'):
-                    pdf_path = os.path.join(root, file)
-                    pdf_files.append(pdf_path)
-        
-        if not pdf_files:
-            print("No PDF files found to merge")
-            return
-            
-        # Sort PDFs by creation time
-        pdf_files.sort(key=lambda x: os.path.getctime(x))
-        
-        # Merge PDFs
-        for pdf in pdf_files:
-            merger.append(pdf)
-            
-        # Use the directory name (from CSV) for the final PDF
-        csv_name = os.path.basename(output_dir)
-        merged_path = os.path.join(output_dir, f'{csv_name}.pdf')
-        merger.write(merged_path)
-        merger.close()
-        
-        print(f"\nMerged {len(pdf_files)} PDF reports into: {merged_path}")
-        
-    except Exception as e:
-        print(f"Error merging PDFs: {str(e)}")
-        traceback.print_exc()
+            except Exception as e:
+                print(f"Error cleaning up video file: {str(e)}")
 
 def process_reels(csv_path: str, min_views: int = 0, num_reels: int = None) -> None:
-    """
-    Process multiple reels and create combined report
-    
-    Args:
-        csv_path: Path to CSV file containing reel URLs
-        min_views: Minimum number of views to process (default: 0)
-        num_reels: Number of reels to process (default: None = all reels)
-    """
-    # Create output directory based on CSV name
+    """Process multiple reels and create combined report"""
     output_dir = os.path.splitext(csv_path)[0]
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
         
-    # Read URLs from CSV
     try:
-        # Read CSV with proper column names
         df = pd.read_csv(csv_path)
         total_reels = len(df)
         print(f"\nFound {total_reels} total reels in CSV")
         
-        # Filter by minimum views
         if min_views > 0:
             df = df[df['Views'] >= min_views]
-            filtered_reels = len(df)
-            print(f"Found {filtered_reels} reels with {min_views:,}+ views")
+            print(f"Found {len(df)} reels with {min_views:,}+ views")
         
-        # Sort by views descending
         df = df.sort_values('Views', ascending=False)
         
-        # Limit number of reels if specified
         if num_reels and num_reels < len(df):
             df = df.head(num_reels)
             print(f"Will process top {num_reels} reels")
         else:
             print(f"Will process all {len(df)} qualifying reels")
         
-        # Get final list of URLs
         urls = df['Reel URL'].tolist()
         
         if not urls:
@@ -568,95 +209,86 @@ def process_reels(csv_path: str, min_views: int = 0, num_reels: int = None) -> N
                 traceback.print_exc()
                 continue
         
-        # After processing all reels, merge the PDFs
         merge_pdf_reports(output_dir)
             
     except Exception as e:
         print(f"Error reading CSV: {str(e)}")
         traceback.print_exc()
-        return
 
-def analyze_video_style(frame) -> Dict[str, str]:
-    """Analyze video style (color, lighting, composition)"""
+def merge_pdf_reports(output_dir: str) -> None:
+    """Merge all PDF reports into a single file"""
     try:
-        # Convert to HSV for better color analysis
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        merger = PdfMerger()
+        pdf_files = []
         
-        # Analyze brightness (V channel)
-        v_channel = hsv[:,:,2]
-        mean_brightness = np.mean(v_channel)
-        std_brightness = np.std(v_channel)
+        # Find all PDF files in subdirectories
+        for root, dirs, files in os.walk(output_dir):
+            for file in files:
+                if file.endswith('text_analysis.pdf'):
+                    pdf_path = os.path.join(root, file)
+                    pdf_files.append(pdf_path)
         
-        # Determine lighting
-        if mean_brightness > 200:
-            lighting = "High-key/Bright"
-        elif mean_brightness > 150:
-            lighting = "Well-lit"
-        elif mean_brightness > 100:
-            lighting = "Medium"
-        else:
-            lighting = "Low-key/Dark"
+        if not pdf_files:
+            print("No PDF files found to merge")
+            return
             
-        # Analyze contrast
-        if std_brightness > 60:
-            contrast_level = "High contrast"
-        elif std_brightness > 30:
-            contrast_level = "Medium contrast"
-        else:
-            contrast_level = "Low contrast"
-            
-        # Analyze color distribution
-        s_channel = hsv[:,:,1]
-        mean_saturation = np.mean(s_channel)
+        # Sort PDF files by directory name to maintain order
+        pdf_files.sort()
         
-        if mean_saturation > 150:
-            color_style = "Vibrant/Saturated"
-        elif mean_saturation > 100:
-            color_style = "Natural colors"
-        elif mean_saturation > 50:
-            color_style = "Muted colors"
-        else:
-            color_style = "Minimal/Clean"
-            
-        # Basic composition analysis
-        height, width = frame.shape[:2]
-        center_region = frame[height//4:3*height//4, width//4:3*width//4]
-        center_brightness = np.mean(center_region)
-        edge_brightness = np.mean(frame) - center_brightness
+        # Add each PDF to the merger
+        for pdf in pdf_files:
+            try:
+                merger.append(pdf)
+            except Exception as e:
+                print(f"Error adding PDF {pdf}: {str(e)}")
+                continue
         
-        if abs(edge_brightness) > 30:
-            composition = "Vignette/Focused"
-        elif std_brightness < 20:
-            composition = "Studio/Clean"
-        else:
-            composition = "Natural/Documentary"
+        # Write the merged PDF one folder above
+        parent_dir = os.path.dirname(output_dir)
+        output_path = os.path.join(parent_dir, f'{os.path.basename(output_dir)}.pdf')
+        merger.write(output_path)
+        merger.close()
         
-        return {
-            'lighting': lighting,
-            'contrast_level': contrast_level,
-            'color_style': color_style,
-            'composition': composition
-        }
+        print(f"\nMerged {len(pdf_files)} PDF reports into: {output_path}")
         
     except Exception as e:
-        print(f"Error in style analysis: {str(e)}")
-        return {
-            'lighting': 'unknown',
-            'contrast_level': 'unknown',
-            'color_style': 'unknown',
-            'composition': 'unknown'
-        }
+        print(f"Error merging PDFs: {str(e)}")
+        traceback.print_exc()
 
 def main():
-    # Check for FFmpeg first
     check_ffmpeg()
     
-    # Configuration
-    CSV_PATH = 'elbowdesign reels.csv'
-    MIN_VIEWS = 1000000  # minimum 100k views
+    # Get all CSV files in the current directory
+    csv_files = [f for f in os.listdir() if f.endswith('.csv')]
+    
+    if not csv_files:
+        print("No CSV files found in current directory")
+        return
+        
+    print(f"Found {len(csv_files)} CSV files to process:")
+    for csv_file in csv_files:
+        print(f"- {csv_file}")
+    
+    MIN_VIEWS = 100000  # minimum 100k views
     NUM_REELS = 25  # Set to None for all reels, or a number to limit
     
-    process_reels(CSV_PATH, MIN_VIEWS, NUM_REELS)
+    # Process each CSV file
+    for csv_file in csv_files:
+        print(f"\n{'='*50}")
+        print(f"Processing {csv_file}...")
+        print(f"{'='*50}")
+        
+        try:
+            process_reels(csv_file, MIN_VIEWS, NUM_REELS)
+        except Exception as e:
+            print(f"Error processing {csv_file}: {str(e)}")
+            traceback.print_exc()
+            continue
+        
+    print("\nAll CSV files processed!")
+
+if __name__ == "__main__":
+    main()
 
 if __name__ == "__main__":
     main()
