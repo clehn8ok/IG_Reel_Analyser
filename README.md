@@ -58,7 +58,7 @@ https://chatgpt.com/g/g-IFMr5Eo4h-contentbot
 My ChatGPT Prompt for IG Reels:
 💡 Prompt:
 
-    "Generate a high-retention Instagram Reel script for a 3D printing audience using the following format and style requirements. The script should follow the 'but, therefore' storytelling technique, maintain emotional oscillation, and be under 30 seconds. Use the PDFs as guidelines for structure and tone."
+    Generate a high-retention Instagram Reel script for a 3D printing audience using the following format and style requirements. The script should follow the 'but, therefore' storytelling technique, maintain emotional oscillation, and be under 30 seconds. Use the PDFs as guidelines for structure and tone.
 
 🎯 Format & Style Requirements:
 
